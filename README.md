@@ -99,7 +99,26 @@ Periodic automation example (cron, every six hours at quiet hours):
 ```cron
 0 */6 * * * /usr/local/bin/dedup --apply --quiet
 ```
+## Example Application in .bashrc
 
+```if [[ -x /usr/local/lib/dedup ]]; then
+    _hd_now=$(date +%s)
+    _hd_marker="${XDG_CACHE_HOME:-$HOME/.cache}/hist-dedup.last"
+    _hd_last=$(cat "$_hd_marker" 2>/dev/null)
+    [[ $_hd_last =~ ^[0-9]+$ ]] || _hd_last=0
+    if (( _hd_now - _hd_last > 21600 )); then   # throttle: at most every 6h
+        _hd_sessions=$(ps -u "$USER" -o tty=,comm= 2>/dev/null | awk '$1 ~ /^pts\// && $2 ~ /^bash/ {c++} END {print c+0}')
+        if (( _hd_sessions <= 1 )); then
+            if /usr/local/lib/dedup --apply --quiet; then
+                history -c; history -r   # refresh in-memory from cleaned file
+                mkdir -p "${_hd_marker%/*}"
+                printf '%s\n' "$_hd_now" > "$_hd_marker"
+            fi
+        fi
+    fi
+fi
+unset _hd_now _hd_marker _hd_last _hd_sessions
+```
 ## Complexity
 
 Time O(n) — one pass over the lines, or two passes for `--keep-last`. Memory O(u) — the unique-key set plus one entry buffer. The hash-set design holds until the unique-key set approaches RAM; the documented fallbacks for that regime are external sorting (`sort -u`) or a SQLite staging pass — the design atuin and mcfly use for persistent history stores. For a bash history file, that boundary is not approached in practice.
