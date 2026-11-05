@@ -101,7 +101,8 @@ Periodic automation example (cron, every six hours at quiet hours):
 ```
 ## Example Application in .bashrc
 
-```if [[ -x /usr/local/lib/dedup ]]; then
+```
+if [[ -x /usr/local/lib/dedup ]]; then
     _hd_now=$(date +%s)
     _hd_marker="${XDG_CACHE_HOME:-$HOME/.cache}/hist-dedup.last"
     _hd_last=$(cat "$_hd_marker" 2>/dev/null)
