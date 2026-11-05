@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""dedup v4 -- analytically-specified bash history deduplication.
+
+Problem class: streaming order-preserving exact duplicate elimination
+(hash-set membership). NOT sorting (chronology must be preserved;
+membership does it in O(n) with order kept for free). NOT compression
+(entry selection; output bytes are input bytes). Design rationale,
+sources, and rejected alternatives: README.md.
+
+Layer separation (policy is specified first; mechanism follows; each
+concern is independently testable):
+  segmentation  bytes-native 2-state scan; marker regex ^#1[0-9]{9}$;
+                leading content before the first marker = one entry;
+                markerless files: one entry per line
+  key policy    default: command text, each line rstripped of the five
+                ASCII whitespace bytes; timestamp markers excluded from
+                the key; orphans keyed by marker; unmarked leading
+                content under a NUL sentinel (NUL cannot occur in a
+                bash history line, so sentinels cannot collide)
+  membership    built-in set of bytes keys: hash table, value
+                comparison, exact -- no digest collision analysis
+  persistence   single-pass streaming write to a mkstemp temp file in
+                the same directory + os.replace (atomic rename);
+                hardlink backup O(1) with streaming-copy fallback;
+                rotated .bak.N generations; trailing-newline state
+                preserved
+
+Modes:
+  default             one entry per distinct command text, FIRST kept
+  --keep-last         one entry per distinct command text, LAST kept
+                      (two-pass: dict key -> last index; emit at index)
+  --exact             byte-identical entries only
+  --collapse-commands  deprecated alias for --keep-last
+
+Complexity: time O(n) (one pass; two passes for --keep-last); memory
+O(u) where u = total unique canonical bytes, plus one entry buffer.
+Adversarial all-unique input drives u toward file size; documented
+fallbacks for that regime are GNU sort -u external merge or a SQLite
+staging pass (the atuin/mcfly design). Not implemented for a bash
+history file.
+
+Do not run --apply while other interactive bash sessions are open unless
+they re-read the file afterwards (`history -c; history -r`).
+
+Usage:
+  dedup                              # dry run: report only, no writes
+  dedup --apply                      # rewrite, rotate backups
+  dedup --apply --quiet              # no report (cron/bashrc use)
+  dedup --apply --no-backup          # rewrite without backups
+  dedup --keep-last --apply          # keep LAST occurrence
+  dedup --exact --apply              # byte-identical mode
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+# Extended-history markers: 10-digit epoch (2001-09-09 .. 2286-11-20).
+MARKER_RE = re.compile(rb"^#1[0-9]{9}$")
+# The exact bytes the canonicalization strips from every line end.
+# Explicit, so key semantics are defined by this file, not by library
+# defaults (and are pure ASCII by construction).
+STRIP_BYTES = b" \t\n\r\v\f"
+# NUL cannot appear in a bash history line (readline C strings), so
+# NUL-prefixed sentinels cannot collide with any command text.
+O_KEY = b"\x00O"   # orphan: a marker whose block is empty
+U_KEY = b"\x00U"   # unmarked leading content before the first marker
+E_KEY = b"\x00E"   # --exact mode namespace
+
+
+class HistoryEntries:
+    """Streaming 2-state entry scanner (segmentation layer).
+
+    Yields (marker: bytes, block: list[bytes]); newline bytes are never
+    part of any line. eof_newline holds the trailing-newline state of
+    the file after iteration (True/False; None for an empty file).
+    One pass, O(longest line) memory.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.eof_newline = None
+
+    def __iter__(self):
+        started = False              # have we seen the first marker?
+        pending: list[bytes] = []    # lines before the first marker
+        marker, block = b"", []
+        with open(self.path, "rb") as fh:
+            for raw in fh:
+                self.eof_newline = raw.endswith(b"\n")
+                line = raw[:-1] if self.eof_newline else raw
+                if MARKER_RE.match(line):
+                    if not started:
+                        started = True
+                        if pending:
+                            yield b"", pending   # unmarked leading block
+                    else:
+                        yield marker, block     # orphans preserved too
+                    marker, block = line, []
+                elif started:
+                    block.append(line)
+                else:
+                    pending.append(line)
+        if not started:
+            for line in pending:      # markerless file: one entry per line
+                yield b"", [line]
+        elif marker or block:
+            yield marker, block
+
+
+def canonical(block: list[bytes]) -> bytes:
+    """The default key body: each line rstripped, joined with newline."""
+    return b"\n".join(line.rstrip(STRIP_BYTES) for line in block)
+
+
+def text_key(marker: bytes, block: list[bytes]) -> bytes:
+    """Default policy: command text; timestamp excluded."""
+    if not block:
+        return O_KEY + marker
+    return (U_KEY if not marker else b"") + canonical(block)
+
+
+def exact_key(marker: bytes, block: list[bytes]) -> bytes:
+    """Byte-identical-entries policy. The key is injective in the
+    entry's raw bytes (a marker is exactly 11 bytes or empty)."""
+    return E_KEY + marker + b"\n".join(block)
+
+
+class LineSink:
+    """Streams kept lines to a file object, one-line lookahead, so the
+    original trailing-newline state is restored at close time."""
+
+    def __init__(self, fh):
+        self.fh = fh
+        self._pending = None
+
+    def feed(self, line: bytes) -> None:
+        if self._pending is not None:
+            self.fh.write(self._pending + b"\n")
+        self._pending = line
+
+    def feed_all(self, lines) -> None:
+        for line in lines:
+            self.feed(line)
+
+    def close(self, eof_newline) -> None:
+        if self._pending is not None:
+            self.fh.write(self._pending + (b"\n" if eof_newline else b""))
+
+
+def scan_first(entries, key_of, sink):
+    """Single pass: keep the first occurrence per key. Returns counts."""
+    seen = set()
+    n = kept = multiline = 0
+    for marker, block in entries:
+        n += 1
+        if len(block) > 1:
+            multiline += 1
+        key = key_of(marker, block)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept += 1
+        if sink is not None:
+            if marker:
+                sink.feed(marker)
+            sink.feed_all(block)
+    return n, kept, multiline
+
+
+def scan_last_positions(entries, key_of):
+    """Pass 1 of --keep-last: dict overwrite keeps the last index."""
+    last = {}
+    n = multiline = 0
+    for marker, block in entries:
+        if len(block) > 1:
+            multiline += 1
+        last[key_of(marker, block)] = n
+        n += 1
+    return last, n, multiline
+
+
+def scan_last_emit(entries, key_of, last, sink):
+    """Pass 2 of --keep-last: emit exactly the recorded last positions."""
+    kept = 0
+    for i, (marker, block) in enumerate(entries):
+        if last[key_of(marker, block)] != i:
+            continue
+        kept += 1
+        if sink is not None:
+            if marker:
+                sink.feed(marker)
+            sink.feed_all(block)
+    return kept
+
+
+def rotate_backups(path: Path, generations: int) -> None:
+    """Shift <file>.bak.<i> up one generation, then .bak -> .bak.1."""
+    for i in range(generations - 1, 0, -1):
+        src = path.with_name(f"{path.name}.bak.{i}")
+        if src.exists():
+            os.replace(src, path.with_name(f"{path.name}.bak.{i + 1}"))
+    bak = path.with_name(path.name + ".bak")
+    if bak.exists():
+        os.replace(bak, path.with_name(path.name + ".bak.1"))
+
+
+def make_backup(path: Path) -> Path:
+    """Fresh <file>.bak = pre-rewrite content. Hardlink first: O(1),
+    same directory guarantees the same filesystem; link(2) never
+    overwrites, and rotation has already vacated the name. Streaming
+    copy as fallback for filesystems without hardlinks."""
+    bak = path.with_name(path.name + ".bak")
+    try:
+        os.link(path, bak)
+    except OSError:
+        shutil.copyfile(path, bak)
+    return bak
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Entry-aware bash history deduplication "
+                    "(streaming hash-set; see dedup-analysis).")
+    parser.add_argument("--history", default=os.path.expanduser("~/.bash_history"),
+                        help="history file (default: ~/.bash_history)")
+    parser.add_argument("--apply", action="store_true",
+                        help="rewrite the file (default: dry run)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="suppress the report (for .bashrc/cron use)")
+    parser.add_argument("--no-backup", action="store_true",
+                        help="do not write <file>.bak on rewrite")
+    parser.add_argument("--backup-generations", type=int, default=8,
+                        help="retain N rotated older states (<file>.bak.1..N)")
+    parser.add_argument("--keep-last", action="store_true",
+                        help="keep the LAST occurrence per command text "
+                             "(default: first)")
+    parser.add_argument("--exact", action="store_true",
+                        help="remove only byte-identical entries "
+                             "(marker + block)")
+    parser.add_argument("--collapse-commands", action="store_true",
+                        help="deprecated alias for --keep-last")
+    args = parser.parse_args()
+
+    keep_last = args.keep_last or args.collapse_commands
+    if keep_last and args.exact:
+        print("dedup: error: --keep-last and --exact are exclusive",
+              file=sys.stderr)
+        return 2
+
+    path = Path(args.history).expanduser()
+    if not path.is_file():
+        print(f"dedup: error: {path} not found", file=sys.stderr)
+        return 1
+
+    key_of = exact_key if args.exact else text_key
+    mode = ("byte-identical entries" if args.exact else
+            "command text, keep-" + ("last" if keep_last else "first"))
+
+    tmp_name = None
+    sink = None
+    try:
+        if args.apply:
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix="." + path.name + "-")
+            sink = LineSink(os.fdopen(tmp_fd, "wb"))
+
+        if keep_last:
+            first = HistoryEntries(path)
+            last, n, multiline = scan_last_positions(iter(first), key_of)
+            kept = n - len(last)
+            if sink is not None:
+                second = HistoryEntries(path)     # pass 2 re-reads the file
+                emitted = scan_last_emit(iter(second), key_of, last, sink)
+                if emitted != kept:
+                    raise SystemExit("dedup: internal consistency "
+                                     "failure (pass counts diverged)")
+                sink.close(second.eof_newline)
+        else:
+            entries = HistoryEntries(path)
+            n, kept, multiline = scan_first(iter(entries), key_of, sink)
+            if sink is not None:
+                sink.close(entries.eof_newline)
+
+        if sink is not None:
+            sink.fh.close()
+        removed = n - kept
+
+        if not args.quiet:
+            print(f"file: {path}")
+            print(f"mode: {mode}")
+            print(f"entries: {n}  kept: {kept}  removed: {removed}  "
+                  f"multiline: {multiline}")
+        if not args.apply:
+            if not args.quiet:
+                print("(dry run: no file modified; pass --apply to rewrite)")
+            return 0
+        if removed == 0:
+            if tmp_name is not None:
+                os.unlink(tmp_name)
+            return 0
+
+        if not args.no_backup:
+            if args.backup_generations > 0:
+                rotate_backups(path, args.backup_generations)
+            make_backup(path)
+
+        os.chmod(tmp_name, path.stat().st_mode & 0o777)
+        os.replace(tmp_name, path)   # atomic rename, same filesystem
+
+        if not args.quiet:
+            print(f"history rewritten: {removed} entries removed"
+                  + ("" if args.no_backup else f"; backup: {path.name}.bak"))
+        return 0
+    finally:
+        if sink is not None and not sink.fh.closed:
+            sink.fh.close()
+        if tmp_name is not None and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
